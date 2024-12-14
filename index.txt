@@ -1,0 +1,540 @@
+import os
+from flask import Flask, request, render_template, jsonify, send_from_directory
+import cv2
+import numpy as np
+import fitz  # PyMuPDF
+from docx import Document
+from io import BytesIO
+import pythoncom
+from win32com import client
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = os.path.join(os.getcwd(), 'uploads')
+app.config['STATIC_FOLDER'] = os.path.join(os.getcwd(), 'static', 'uploads')
+app.config['ALLOWED_EXTENSIONS'] = {'pdf', 'jpg', 'jpeg', 'png', 'docx', 'doc'}
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['STATIC_FOLDER'], exist_ok=True)
+
+images = []  # Store images globally for simplicity
+total_pages = 0  # Keep track of total pages
+selected_previews = []  # Store paths to selected preview images
+
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+
+def pdf_to_images(pdf_path):
+    document = fitz.open(pdf_path)
+    pdf_images = []
+    for page_num in range(len(document)):
+        page = document.load_page(page_num)
+        pix = page.get_pixmap(alpha=False)
+        image = np.frombuffer(pix.samples, dtype=np.uint8).reshape((pix.height, pix.width, 3))
+        pdf_images.append(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+    document.close()
+    return pdf_images
+
+
+def docx_to_images(docx_path):
+    try:
+        pythoncom.CoInitialize()  # Initialize COM
+        word = client.Dispatch("Word.Application")
+        word.visible = False
+        doc = word.Documents.Open(docx_path)
+
+        pdf_path = docx_path.replace('.docx', '.pdf')
+        doc.SaveAs(pdf_path, FileFormat=17)
+        doc.Close()
+
+        images = pdf_to_images(pdf_path)
+        os.remove(pdf_path)
+        return images
+    except Exception as e:
+        print(f"Error during DOCX to PDF conversion: {e}")
+        return []
+
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    global images, total_pages
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    if file and allowed_file(file.filename):
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+        file.save(filepath)
+
+        if filepath.endswith('.pdf'):
+            images = pdf_to_images(filepath)
+            total_pages = len(images)
+        elif filepath.endswith(('.jpg', '.jpeg', '.png')):
+            images = [cv2.imread(filepath)]
+            total_pages = 1
+        elif filepath.endswith(('.docx', '.doc')):
+            images = docx_to_images(filepath)
+            total_pages = len(images)
+        else:
+            return jsonify({"error": "Unsupported file format"}), 400
+
+        return jsonify({
+            "message": "File uploaded successfully!",
+            "fileName": file.filename,
+            "totalPages": total_pages
+        }), 200
+
+    return jsonify({"error": "Invalid file format"}), 400
+
+
+@app.route('/generate_preview', methods=['POST'])
+def generate_preview():
+    global images, selected_previews
+    data = request.json
+    page_from = int(data.get('pageFrom', 1))
+    page_to = int(data.get('pageTo', 1))
+    num_copies = int(data.get('numCopies', 1))
+    page_size = data.get('pageSize', 'A4')
+    color_option = data.get('colorOption', 'Color')
+
+    try:
+        selected_images = images[page_from-1:page_to]
+
+        previews = []
+        for idx, img in enumerate(selected_images):
+            processed_img = img.copy()
+
+            if page_size == 'Short':
+                processed_img = cv2.resize(processed_img, (800, 1000))
+            elif page_size == 'Long':
+                processed_img = cv2.resize(processed_img, (800, 1200))
+            elif page_size == 'A4':
+                processed_img = cv2.resize(processed_img, (800, 1100))
+
+            if color_option == 'Grayscale':
+                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_BGR2GRAY)
+                processed_img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
+
+            for _ in range(num_copies):
+                preview_path = os.path.join(app.config['STATIC_FOLDER'], f"preview_{idx + 1}_{page_size}_{color_option}.jpg")
+                cv2.imwrite(preview_path, processed_img)
+                previews.append(f"/uploads/preview_{idx + 1}_{page_size}_{color_option}.jpg")
+
+        selected_previews = previews  # Save for rendering in result.html
+        return jsonify({"previews": previews}), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to generate previews: {e}"}), 500
+
+
+@app.route('/result', methods=['GET'])
+def result():
+    global selected_previews
+    return render_template('result.html', previews=selected_previews)
+
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['STATIC_FOLDER'], filename)
+
+
+if __name__ == "__main__":
+    app.run(debug=True)
+
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload and Print Preview</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+    <style>
+        .preview-container {
+            max-height: 400px;
+            overflow-y: scroll;
+            border: 1px solid #ccc;
+            padding: 10px;
+            width: 300px;
+        }
+        .preview-page {
+            margin-bottom: 10px;
+            border: 1px solid #ddd;
+        }
+        .preview-page img {
+            max-width: 100%;
+            display: block;
+            margin: auto;
+        }
+        .modal-body {
+            display: flex;
+        }
+        .form-section {
+            flex: 1;
+        }
+        .preview-section {
+            flex: 1;
+            margin-left: 20px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1 class="mt-5">Upload a File for Processing</h1>
+    <form id="uploadForm">
+        <div class="form-group">
+            <label for="file">Choose a file (PDF, DOC, DOCX, JPG, JPEG, PNG)</label>
+            <input type="file" class="form-control" id="file" name="file" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload</button>
+    </form>
+
+    <div id="printOptionsModal" class="modal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Print Options</h5>
+                </div>
+                <div class="modal-body">
+                    <div class="form-section">
+                        <div class="form-group">
+                            <label for="pageFrom">Page From</label>
+                            <input type="number" id="pageFrom" class="form-control" placeholder="1" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="pageTo">Page To</label>
+                            <input type="number" id="pageTo" class="form-control" placeholder="1" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="numCopies">Number of Copies</label>
+                            <input type="number" id="numCopies" class="form-control" value="1" min="1">
+                        </div>
+                        <div class="form-group">
+                            <label for="pageSize">Page Size</label>
+                            <select id="pageSize" class="form-control">
+                                <option value="A4">A4</option>
+                                <option value="Short">Short</option>
+                                <option value="Long">Long</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="colorOption">Color Option</label>
+                            <select id="colorOption" class="form-control">
+                                <option value="Color">Color</option>
+                                <option value="Grayscale">Grayscale</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="preview-section">
+                        <h6>File: <span id="fileName"></span></h6>
+                        <h6>Total Pages: <span id="totalPages"></span></h6>
+                        <h6>Preview</h6>
+                        <div id="previewContainer" class="preview-container"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button id="closeModalBtn" class="btn btn-secondary" data-dismiss="modal">Exit</button>
+                    <button id="continueBtn" class="btn btn-primary">Continue</button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
+<script>
+    let previewTimeout;
+    let totalPages = 0;
+    let fileName = '';
+
+    $('#uploadForm').on('submit', function (e) {
+        e.preventDefault();
+        const formData = new FormData(this);
+
+        $.ajax({
+            url: '/upload',
+            method: 'POST',
+            data: formData,
+            contentType: false,
+            processData: false,
+            success: function (response) {
+                fileName = response.fileName;
+                totalPages = response.totalPages;
+                $('#fileName').text(fileName);
+                $('#totalPages').text(totalPages);
+                $('#printOptionsModal').modal('show');
+
+                $('#pageFrom').val(1);
+                $('#pageTo').val(totalPages);
+
+                updatePreview();
+            },
+            error: function (err) {
+                alert(err.responseJSON.error || 'Upload failed.');
+            }
+        });
+    });
+
+    function updatePreview() {
+        const pageFrom = $('#pageFrom').val();
+        const pageTo = $('#pageTo').val();
+        const numCopies = $('#numCopies').val();
+        const pageSize = $('#pageSize').val();
+        const colorOption = $('#colorOption').val();
+
+        if (!pageFrom || !pageTo || pageFrom > pageTo || pageTo > totalPages) return;
+
+        clearTimeout(previewTimeout);
+
+        previewTimeout = setTimeout(() => {
+            $.ajax({
+                url: '/generate_preview',
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ pageFrom, pageTo, numCopies, pageSize, colorOption }),
+                success: function (response) {
+                    const previewContainer = $('#previewContainer');
+                    previewContainer.empty();
+
+                    response.previews.forEach((preview) => {
+                        const timestampedURL = preview + '?t=' + new Date().getTime();
+                        const pageDiv = $('<div>').addClass('preview-page')
+                            .append($('<img>').attr('src', timestampedURL));
+                        previewContainer.append(pageDiv);
+                    });
+                },
+                error: function (error) {
+                    console.error(error.responseJSON.error || 'Failed to generate previews.');
+                }
+            });
+        }, 300);
+    }
+
+    $('#pageFrom, #pageTo, #numCopies, #pageSize, #colorOption').on('input change', function () {
+        updatePreview();
+    });
+
+    $('#continueBtn').on('click', function () {
+        const options = {
+            pageFrom: $('#pageFrom').val(),
+            pageTo: $('#pageTo').val(),
+            numCopies: $('#numCopies').val(),
+            pageSize: $('#pageSize').val(),
+            colorOption: $('#colorOption').val(),
+            fileName: fileName,
+        };
+
+        // Store options in session storage to retrieve in result.html
+        sessionStorage.setItem('printOptions', JSON.stringify(options));
+
+        // Redirect to result.html
+        window.location.href = '/result';
+    });
+</script>
+</body>
+</html>
+
+
+result
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Result Page</title>
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+</head>
+<body>
+<div class="container">
+    <h1 class="mt-5">Print Preview Results</h1>
+
+    <!-- Section for displaying selected print options -->
+    <div id="printDetails" class="mb-4"></div>
+
+    <!-- Button to open edit modal -->
+    <button class="btn btn-warning" id="editButton" data-toggle="modal" data-target="#editModal">Edit Print Options</button>
+
+    <!-- Preview container -->
+    <div id="previewContainer" class="d-flex flex-wrap"></div>
+</div>
+
+<!-- Edit Print Options Modal -->
+<div class="modal fade" id="editModal" tabindex="-1" aria-labelledby="editModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="editModalLabel">Edit Print Options</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="editForm">
+            <div class="form-group">
+                <label for="editPageFrom">Page From:</label>
+                <input type="number" class="form-control" id="editPageFrom" name="pageFrom" min="1" required>
+            </div>
+            <div class="form-group">
+                <label for="editPageTo">Page To:</label>
+                <input type="number" class="form-control" id="editPageTo" name="pageTo" min="1" required>
+            </div>
+            <div class="form-group">
+                <label for="editNumCopies">Number of Copies:</label>
+                <input type="number" class="form-control" id="editNumCopies" name="numCopies" min="1" required>
+            </div>
+            <div class="form-group">
+                <label for="editPageSize">Page Size:</label>
+                <select class="form-control" id="editPageSize" name="pageSize" required>
+                    <option value="A4">A4</option>
+                    <option value="Short">Short</option>
+                    <option value="Long">Long</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="editColorOption">Color Option:</label>
+                <select class="form-control" id="editColorOption" name="colorOption" required>
+                    <option value="Color">Color</option>
+                    <option value="Grayscale">Grayscale</option>
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Apply Changes</button>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        // Retrieve print options from session storage
+        const options = JSON.parse(sessionStorage.getItem('printOptions'));
+        if (!options) {
+            alert('No print options found!');
+            return;
+        }
+
+        // Display selected options
+        const printDetails = document.getElementById('printDetails');
+        printDetails.innerHTML = `
+            <h5>Selected Options:</h5>
+            <ul>
+                <li><strong>File:</strong> ${options.fileName}</li>
+                <li><strong>Page Range:</strong> ${options.pageFrom} to ${options.pageTo}</li>
+                <li><strong>Number of Copies:</strong> ${options.numCopies}</li>
+                <li><strong>Page Size:</strong> ${options.pageSize}</li>
+                <li><strong>Color Option:</strong> ${options.colorOption}</li>
+            </ul>
+        `;
+
+        // Fetch previews for the selected options
+        fetch('/generate_preview', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(options),
+        })
+            .then(response => response.json())
+            .then(data => {
+                const previewContainer = document.getElementById('previewContainer');
+                previewContainer.innerHTML = '';
+
+                data.previews.forEach(preview => {
+                    const previewElement = document.createElement('div');
+                    previewElement.classList.add('m-2', 'border', 'p-2');
+                    previewElement.innerHTML = `<img src="${preview}" alt="Preview" style="max-width: 200px;">`;
+                    previewContainer.appendChild(previewElement);
+                });
+            })
+            .catch(error => {
+                console.error('Error fetching previews:', error);
+            });
+
+        // Populate the edit modal with the current options
+        const editPageFrom = document.getElementById('editPageFrom');
+        const editPageTo = document.getElementById('editPageTo');
+        const editNumCopies = document.getElementById('editNumCopies');
+        const editPageSize = document.getElementById('editPageSize');
+        const editColorOption = document.getElementById('editColorOption');
+
+        // Set values in modal form fields
+        editPageFrom.value = options.pageFrom;
+        editPageTo.value = options.pageTo;
+        editNumCopies.value = options.numCopies;
+        editPageSize.value = options.pageSize;
+        editColorOption.value = options.colorOption;
+
+        // Handle form submission in the modal
+        document.getElementById('editForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+
+            // Update the session storage with the new values
+            options.pageFrom = editPageFrom.value;
+            options.pageTo = editPageTo.value;
+            options.numCopies = editNumCopies.value;
+            options.pageSize = editPageSize.value;
+            options.colorOption = editColorOption.value;
+
+            // Save the updated options to session storage
+            sessionStorage.setItem('printOptions', JSON.stringify(options));
+
+            // Close the modal
+            $('#editModal').modal('hide');
+
+            // Update the print details on the page
+            printDetails.innerHTML = `
+                <h5>Selected Options:</h5>
+                <ul>
+                    <li><strong>File:</strong> ${options.fileName}</li>
+                    <li><strong>Page Range:</strong> ${options.pageFrom} to ${options.pageTo}</li>
+                    <li><strong>Number of Copies:</strong> ${options.numCopies}</li>
+                    <li><strong>Page Size:</strong> ${options.pageSize}</li>
+                    <li><strong>Color Option:</strong> ${options.colorOption}</li>
+                </ul>
+            `;
+
+            // Re-generate the preview with updated options
+            fetch('/generate_preview', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(options),
+            })
+                .then(response => response.json())
+                .then(data => {
+                    const previewContainer = document.getElementById('previewContainer');
+                    previewContainer.innerHTML = '';
+
+                    data.previews.forEach(preview => {
+                        const previewElement = document.createElement('div');
+                        previewElement.classList.add('m-2', 'border', 'p-2');
+                        previewElement.innerHTML = `<img src="${preview}" alt="Preview" style="max-width: 200px;">`;
+                        previewContainer.appendChild(previewElement);
+                    });
+                })
+                .catch(error => {
+                    console.error('Error fetching previews:', error);
+                });
+        });
+    });
+</script>
+
+<script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
+
+</body>
+</html>
